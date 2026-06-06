@@ -562,5 +562,4 @@ st.caption(f"""
 This tool is for decision support and discussion purposes only. It does not constitute formal financial advice.  
 All calculations use the assumptions shown in the sidebar. For bespoke client versions or integration with your existing systems, contact Greenwich Strategy Ltd.
 """)
-Upgrade to SuperGrok
 Mehgam Project NPV with Put Option - Grok
