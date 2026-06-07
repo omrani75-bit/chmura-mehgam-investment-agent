@@ -53,6 +53,7 @@ try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.units import cm
+    from reportlab.lib.utils import ImageReader, simpleSplit
     HAS_RL = True
 except ImportError:
     HAS_RL = False
@@ -328,80 +329,296 @@ def _rule(q, b, p, e):
 # ==============================================================
 # PDF GENERATOR
 # ==============================================================
-def generate_pdf(md, rec, date_str):
-    buf = io.BytesIO()
+def _fig_reader(fig, dpi=150):
+    b = io.BytesIO()
+    fig.savefig(b, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    b.seek(0)
+    return ImageReader(b)
+
+
+def _chart_bridge(md):
+    base, opt, tot = md["base_npv_m"], md["put_m"], md["expanded_m"]
+    fig, ax = plt.subplots(figsize=(6.4, 2.9))
+    ax.bar(0, base, color=(GREEN if base >= 0 else RED), width=0.6, edgecolor="white")
+    ax.bar(1, opt, bottom=min(base, base + opt) if base < 0 else base,
+           color=TEAL, width=0.6, edgecolor="white")
+    ax.bar(2, tot, color=GOLD, width=0.6, edgecolor="white")
+    if base < 0:
+        ax.bar(1, opt, bottom=base, color=TEAL, width=0.6, edgecolor="white")
+    ax.axhline(0, color="#444", linewidth=0.8)
+    for x, v in [(0, base), (2, tot)]:
+        ax.text(x, v + (0.12 if v >= 0 else -0.18), f"${v:.2f}m",
+                ha="center", fontsize=10, fontweight="bold")
+    ax.text(1, base + opt + 0.12, f"+${opt:.2f}m", ha="center", fontsize=10,
+            fontweight="bold", color=TEAL)
+    ax.set_xticks([0, 1, 2])
+    ax.set_xticklabels(["Stand-alone\nNPV", "Bulud\noption", "Total strategic\nvalue"],
+                       fontsize=9)
+    ax.set_ylabel("$m", fontsize=9)
+    lo = min(0, base) - 0.4
+    hi = max(tot, base + opt) * 1.18
+    ax.set_ylim(lo, hi)
+    ax.spines[["top", "right"]].set_visible(False)
+    return _fig_reader(fig)
+
+
+def _chart_cashflow(md):
+    yrs = list(range(1, 6))
+    fig, ax = plt.subplots(figsize=(6.4, 2.9))
+    cols = [GREEN if v >= 0 else RED for v in md["pv_m"]]
+    ax.bar(yrs, md["pv_m"], color=cols, width=0.55, edgecolor="white", label="PV per year")
+    cum = [-md["initial_m"]] + list(np.cumsum(md["pv_m"]) - md["initial_m"])
+    ax.plot(range(0, 6), cum, color=GOLD, marker="o", markersize=4, linewidth=2,
+            label="Cumulative NPV")
+    ax.axhline(0, color="#444", linewidth=0.8)
+    ax.set_xticks(range(0, 6))
+    ax.set_xlabel("Year", fontsize=9); ax.set_ylabel("$m", fontsize=9)
+    ax.legend(fontsize=8, frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    return _fig_reader(fig)
+
+
+def _chart_tornado(params):
+    base_e = run_model(**params)["expanded_m"]
+    specs = [("Sales volume (\u00b115%)", "vol_mult", 0.15),
+             ("Cost inflation (\u00b12pp)", "inf_cost", 0.02),
+             ("Price inflation (\u00b11pp)", "inf_price", 0.01),
+             ("Discount rate (\u00b11pp)", "wacc", 0.01),
+             ("Volatility (\u00b110pp)", "sigma", 0.10)]
+    rows = []
+    for label, key, d in specs:
+        lo = dict(params); lo[key] = params[key] - d
+        hi = dict(params); hi[key] = params[key] + d
+        e_lo = run_model(**lo)["expanded_m"]
+        e_hi = run_model(**hi)["expanded_m"]
+        rows.append((label, e_lo, e_hi, abs(e_hi - e_lo)))
+    rows.sort(key=lambda r: r[3])
+    fig, ax = plt.subplots(figsize=(6.4, 3.0))
+    for i, (label, e_lo, e_hi, _) in enumerate(rows):
+        left, width = min(e_lo, e_hi), abs(e_hi - e_lo)
+        ax.barh(i, width, left=left, height=0.6, color=TEAL, alpha=0.85, edgecolor="white")
+        ax.text(left - 0.05, i, f"${e_lo:.1f}", va="center", ha="right", fontsize=7.5, color="#555")
+        ax.text(left + width + 0.05, i, f"${e_hi:.1f}", va="center", ha="left", fontsize=7.5, color="#555")
+    ax.axvline(base_e, color=PRIMARY, linewidth=1.5, linestyle="--", label=f"Base ${base_e:.2f}m")
+    all_vals = [v for r in rows for v in (r[1], r[2])]
+    span = max(all_vals) - min(all_vals)
+    ax.set_xlim(min(all_vals) - span * 0.18, max(all_vals) + span * 0.12)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([r[0] for r in rows], fontsize=8.5)
+    ax.set_xlabel("Expanded NPV ($m)", fontsize=9)
+    ax.legend(fontsize=8, frameon=False, loc="lower right")
+    ax.spines[["top", "right"]].set_visible(False)
+    return _fig_reader(fig)
+
+
+def _pdf_header(c, w, h, subtitle):
+    c.setFillColor(rl_colors.HexColor(PRIMARY))
+    c.rect(0, h - 62, w, 62, fill=True, stroke=False)
+    c.setFillColor(rl_colors.HexColor(TEAL))
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(40, h - 40, "GS")
+    c.setFillColor(rl_colors.white)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(74, h - 30, "GREENWICH STRATEGY LTD")
+    c.setFont("Helvetica", 8.5)
+    c.drawString(74, h - 46, subtitle)
+    c.setFillColor(rl_colors.HexColor("#C8A24B"))
+    c.setFont("Helvetica-Oblique", 8)
+    c.drawRightString(w - 40, h - 40, "Strictly confidential")
+
+
+def _pdf_footer(c, w, page_no, date_str):
+    c.setFillColor(rl_colors.HexColor(TEAL))
+    c.rect(0, 0, w, 22, fill=True, stroke=False)
+    c.setFillColor(rl_colors.white)
+    c.setFont("Helvetica", 7.5)
+    c.drawString(40, 7.5, f"Greenwich Strategy Ltd  |  Glasgow, Scotland  |  {date_str}")
+    c.drawRightString(w - 40, 7.5, f"Page {page_no} of 3")
+
+
+def _section(c, x, y, title):
+    c.setFillColor(rl_colors.HexColor("#00A896"))
+    c.rect(x, y - 2, 3, 13, fill=True, stroke=False)
+    c.setFillColor(rl_colors.HexColor(PRIMARY))
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x + 9, y, title)
+
+
+def generate_pdf(md, rec_label, date_str, params):
     if not HAS_RL:
         return None
+    buf = io.BytesIO()
     c = rl_canvas.Canvas(buf, pagesize=A4)
     w, h = A4
-    # header bar
+    exp = md["expanded_m"]
+
+    # ============ PAGE 1 — EXECUTIVE SUMMARY ============
+    _pdf_header(c, w, h, "Chmura Co \u2014 Mehgam Manufacturing Investment Appraisal")
+
     c.setFillColor(rl_colors.HexColor(PRIMARY))
-    c.rect(0, h - 72, w, 72, fill=True, stroke=False)
-    c.setFillColor(rl_colors.white)
-    c.setFont("Helvetica-Bold", 15)
-    c.drawCentredString(w / 2, h - 36, "GREENWICH STRATEGY LTD")
-    c.setFont("Helvetica", 10)
-    c.drawCentredString(w / 2, h - 54, "Chmura Co — Mehgam Manufacturing Investment Appraisal")
-    # body
-    c.setFillColor(rl_colors.black)
-    y = h - 100
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, h - 92, "Investment Appraisal & Strategic Options Review")
+    c.setFillColor(rl_colors.HexColor("#666666"))
+    c.setFont("Helvetica", 9)
+    c.drawString(40, h - 108, f"Prepared for the Board of Chmura Co   |   Report date: {date_str}")
+
+    # Recommendation banner
+    band = GREEN if exp > 2 else ("#D69E2E" if exp > 0 else RED)
+    bg   = "#F0FFF4" if exp > 2 else ("#FFFBEB" if exp > 0 else "#FFF5F5")
+    c.setFillColor(rl_colors.HexColor(bg))
+    c.roundRect(40, h - 178, w - 80, 56, 6, fill=True, stroke=False)
+    c.setFillColor(rl_colors.HexColor(band))
+    c.rect(40, h - 178, 4, 56, fill=True, stroke=False)
+    c.setFillColor(rl_colors.HexColor(PRIMARY))
     c.setFont("Helvetica-Bold", 13)
-    c.drawString(40, y, "Executive Summary")
-    y -= 18; c.setFont("Helvetica", 10)
-    c.drawString(40, y, f"Report date: {date_str}")
-    y -= 28; c.setFont("Helvetica-Bold", 11)
-    c.drawString(40, y, "Financial Headline ($m)")
-    y -= 18; c.setFont("Helvetica", 10)
-    rows = [
-        ("Stand-alone base NPV (no option)", f"${md['base_npv_m']:,.2f}m"),
-        ("Abandonment put option value (Bulud)", f"${md['put_m']:,.2f}m"),
-        ("Expanded NPV (base + option)", f"${md['expanded_m']:,.2f}m"),
-        ("IRR (stand-alone)", f"{md['irr']*100:.1f}%" if md['irr'] else "N/A"),
-        ("Initial investment", f"${md['initial_m']:,.1f}m"),
-        ("Effective tax rate (bilateral treaty)", "25%"),
+    clean_label = rec_label.replace("\u2705", "").replace("\u26a0\ufe0f", "").replace("\u274c", "").strip()
+    c.drawString(54, h - 140, clean_label)
+    if exp > 2:
+        body = (f"Expanded NPV of ${exp:.2f}m is clearly positive. The stand-alone base case "
+                f"(${md['base_npv_m']:.2f}m) is marginal, but Bulud's option (${md['put_m']:.2f}m) makes "
+                f"the venture value-accretive. Commit now and retest rigorously at the end of Year 2.")
+    elif exp > 0:
+        body = (f"Expanded NPV of ${exp:.2f}m is modestly positive \u2014 the option is doing the heavy "
+                f"lifting. Proceed only with active monitoring of Year 1\u20132 performance.")
+    else:
+        body = f"Even with the Bulud option, expanded NPV is ${exp:.2f}m. The terms should be revisited."
+    c.setFillColor(rl_colors.HexColor("#333333"))
+    yb = h - 156
+    for ln in simpleSplit(body, "Helvetica", 9, w - 110):
+        c.setFont("Helvetica", 9); c.drawString(54, yb, ln); yb -= 12
+
+    # KPI cards
+    kpis = [("BASE NPV", f"${md['base_npv_m']:.2f}m"),
+            ("PUT OPTION", f"${md['put_m']:.2f}m"),
+            ("EXPANDED NPV", f"${md['expanded_m']:.2f}m"),
+            ("IRR", f"{md['irr']*100:.1f}%" if md['irr'] else "N/A"),
+            ("INVESTMENT", f"${md['initial_m']:.1f}m")]
+    cw = (w - 80) / 5
+    yc = h - 250
+    for i, (lab, val) in enumerate(kpis):
+        x = 40 + i * cw
+        c.setFillColor(rl_colors.HexColor("#F4F6F8"))
+        c.roundRect(x + 3, yc, cw - 6, 52, 5, fill=True, stroke=False)
+        c.setFillColor(rl_colors.HexColor("#7A8699"))
+        c.setFont("Helvetica", 6.5); c.drawString(x + 11, yc + 36, lab)
+        c.setFillColor(rl_colors.HexColor(PRIMARY))
+        c.setFont("Helvetica-Bold", 14); c.drawString(x + 11, yc + 14, val)
+
+    # Value bridge chart
+    _section(c, 40, h - 282, "Value bridge")
+    c.drawImage(_chart_bridge(md), 60, h - 510, width=w - 150, height=210,
+                preserveAspectRatio=True, anchor="n")
+
+    # Key facts strip
+    _section(c, 40, h - 540, "Basis of preparation")
+    facts = [
+        "All operating flows in Mehgam Peso, converted to US$ at PPP-forecast rates (~5.9% p.a. Peso depreciation).",
+        "Effective tax 25% (bilateral treaty \u2014 foreign credit offsets home tax). $500k scoping study treated as sunk.",
+        "Bulud's $28m offer modelled as a Year-2 abandonment put option (Black-Scholes, \u03c3 = "
+        f"{md['sigma']*100:.0f}%).",
+        "Figures verified against ACCA AFM model: base \u2212$0.45m, option +$3.45m, total +$3.00m at base case.",
     ]
-    for label, val in rows:
-        c.drawString(50, y, label)
-        c.drawRightString(w - 40, y, val)
-        y -= 15
-    y -= 20; c.setFont("Helvetica-Bold", 11)
-    c.drawString(40, y, "AI Recommendation")
-    y -= 18; c.setFont("Helvetica", 10)
-    c.drawString(50, y, rec)
-    y -= 30; c.setFont("Helvetica-Bold", 11)
-    c.drawString(40, y, "Option Details")
-    y -= 18; c.setFont("Helvetica", 10)
-    opt_rows = [
-        ("Underlying (PV of Y3–Y5 at t=0)", f"${md['S']:,.2f}m"),
-        ("Exercise price (Bulud offer)", f"${md['K']:,.0f}m"),
-        ("d1", f"{md['d1']:.4f}"), ("d2", f"{md['d2']:.4f}"),
-        ("Time to decision", "2 years"), ("Risk-free rate", "4.0%"),
-        ("Volatility", f"{md['sigma']*100:.0f}%"),
-    ]
+    yf = h - 560
+    for f in facts:
+        for ln in simpleSplit("\u2022  " + f, "Helvetica", 8.5, w - 90):
+            c.setFillColor(rl_colors.HexColor("#444444"))
+            c.setFont("Helvetica", 8.5); c.drawString(46, yf, ln); yf -= 12
+        yf -= 2
+    _pdf_footer(c, w, 1, date_str)
+    c.showPage()
+
+    # ============ PAGE 2 — CASH FLOW ANALYSIS ============
+    _pdf_header(c, w, h, "Cash Flow Analysis")
+    _section(c, 40, h - 92, "Discounted cash flow ($m)")
+    c.drawImage(_chart_cashflow(md), 60, h - 330, width=w - 150, height=215,
+                preserveAspectRatio=True, anchor="n")
+
+    _section(c, 40, h - 356, "Annual figures")
+    df = md["df_usd"]
+    headers = ["Year", "Rate (MP/$)", "USD CF ($m)", "Disc. factor", "PV ($m)"]
+    col_x = [50, 150, 270, 390, 500]
+    c.setFillColor(rl_colors.HexColor(PRIMARY))
+    c.setFont("Helvetica-Bold", 9)
+    yt = h - 378
+    for hx, head in zip(col_x, headers):
+        c.drawString(hx, yt, head)
+    c.setStrokeColor(rl_colors.HexColor("#CCCCCC")); c.line(46, yt - 4, w - 40, yt - 4)
+    yt -= 18
+    c.setFont("Helvetica", 9); c.setFillColor(rl_colors.black)
+    for _, row in df.iterrows():
+        vals = [str(int(row["Year"])), f"{row['Rate (MP/$)']:.2f}",
+                f"{row['USD CF ($m)']:.3f}", f"{row['Discount Factor']:.4f}",
+                f"{row['PV ($m)']:.3f}"]
+        for hx, v in zip(col_x, vals):
+            c.drawString(hx, yt, v)
+        yt -= 16
+    c.setFont("Helvetica-Bold", 9); c.setFillColor(rl_colors.HexColor(PRIMARY))
+    c.line(46, yt + 4, w - 40, yt + 4)
+    c.drawString(50, yt - 6, "Initial investment")
+    c.drawString(col_x[4], yt - 6, f"-${md['initial_m']:.2f}m")
+    yt -= 22
+    c.drawString(50, yt - 6, "Base-case NPV")
+    c.drawString(col_x[4], yt - 6, f"${md['base_npv_m']:.2f}m")
+
+    _section(c, 40, yt - 40, "Reading the cash-flow profile")
+    note = ("Value is concentrated in Years 3\u20134, which together carry the bulk of present value. "
+            "Year 1 is near break-even after heavy training & development spend. Because production costs "
+            "inflate faster than prices, and the Peso weakens against the dollar each year, late-year margins "
+            "are squeezed \u2014 which is precisely why the Year-2 exit option carries material value.")
+    yn = yt - 60
+    for ln in simpleSplit(note, "Helvetica", 9, w - 90):
+        c.setFillColor(rl_colors.HexColor("#444444"))
+        c.setFont("Helvetica", 9); c.drawString(46, yn, ln); yn -= 12
+    _pdf_footer(c, w, 2, date_str)
+    c.showPage()
+
+    # ============ PAGE 3 — RISK & OPTION ============
+    _pdf_header(c, w, h, "Risk & Strategic Option Analysis")
+    _section(c, 40, h - 92, "Sensitivity of expanded NPV")
+    c.drawImage(_chart_tornado(params), 60, h - 320, width=w - 150, height=205,
+                preserveAspectRatio=True, anchor="n")
+
+    _section(c, 40, h - 346, "Bulud abandonment option (Black-Scholes)")
+    opt_rows = [("Underlying Pa \u2014 PV of Year 3\u20135", f"${md['S']:.2f}m"),
+                ("Exercise price Pe \u2014 Bulud offer", f"${md['K']:.0f}m"),
+                ("Time to decision", "2 years"),
+                ("Risk-free rate", f"{params['rf']*100:.1f}%"),
+                ("Volatility \u03c3", f"{md['sigma']*100:.0f}%"),
+                ("d1 / d2", f"{md['d1']:.3f} / {md['d2']:.3f}"),
+                ("Option value", f"${md['put_m']:.2f}m")]
+    yo = h - 366
     for label, val in opt_rows:
-        c.drawString(50, y, label); c.drawRightString(w - 40, y, val); y -= 15
-    y -= 20; c.setFont("Helvetica-Bold", 11)
-    c.drawString(40, y, "Next Steps")
-    y -= 18; c.setFont("Helvetica", 10)
+        c.setFillColor(rl_colors.HexColor("#444444")); c.setFont("Helvetica", 9)
+        c.drawString(50, yo, label)
+        c.setFillColor(rl_colors.HexColor(PRIMARY)); c.setFont("Helvetica-Bold", 9)
+        c.drawRightString(w - 45, yo, val); yo -= 16
+
+    _section(c, 40, yo - 26, "Recommended next steps")
     steps = [
-        "1. Confirm Mehgam protectionist measure reductions per WTO schedule.",
-        "2. Monitor Year 1–2 batch volumes and actual cost inflation vs plan.",
-        "3. At end of Year 2: compare updated PV of Y3–5 vs $28m Bulud offer.",
-        "4. Exercise option if PV remaining < $28m; otherwise continue.",
-        "5. Contact Greenwich Strategy Ltd for board presentation support.",
+        "1.  Confirm Mehgam's protectionist measures are reduced per the WTO schedule before committing.",
+        "2.  Track Year 1\u20132 batch volumes and realised cost inflation against plan each quarter.",
+        "3.  At the end of Year 2, re-forecast the value of Years 3\u20135 and compare against Bulud's $28m offer.",
+        "4.  Exercise the option (sell to Bulud) if the remaining project value falls below $28m; otherwise continue.",
+        "5.  Engage Greenwich Strategy Ltd for board-presentation support and Year-2 re-appraisal.",
     ]
+    ys = yo - 46
     for s in steps:
-        c.drawString(50, y, s); y -= 14
-    # footer
-    c.setFillColor(rl_colors.HexColor(TEAL))
-    c.rect(0, 0, w, 28, fill=True, stroke=False)
-    c.setFillColor(rl_colors.white)
-    c.setFont("Helvetica", 8)
-    c.drawCentredString(w / 2, 10,
-        "Greenwich Strategy Ltd | Glasgow, Scotland | Strictly confidential — client use only")
+        for ln in simpleSplit(s, "Helvetica", 9, w - 95):
+            c.setFillColor(rl_colors.HexColor("#333333"))
+            c.setFont("Helvetica", 9); c.drawString(48, ys, ln); ys -= 13
+        ys -= 3
+    c.setFillColor(rl_colors.HexColor("#999999"))
+    c.setFont("Helvetica-Oblique", 7.5)
+    c.drawString(40, ys - 6,
+                 "Indicative analysis for decision support only \u2014 not formal investment advice.")
+    _pdf_footer(c, w, 3, date_str)
+    c.showPage()
+
     c.save()
     buf.seek(0)
     return buf
+
 
 
 # ==============================================================
@@ -607,7 +824,18 @@ with t1:
         st.info("Add **reportlab** to requirements.txt to enable PDF export.")
     else:
         if st.button("📄 Generate PDF Report", type="primary"):
-            pdf_buf = generate_pdf(model, rec_label, datetime.now().strftime("%d %B %Y"))
+            pdf_params = dict(
+                batches=batches, price0=115200, cost0=46500, special_usd0=200,
+                inf_price=inf_price, inf_cost=inf_cost, packinf=0.05,
+                training_pcts=[0.80, 0.20, 0.0, 0.0, 0.0],
+                dep_mp=125.0, bal_mp=125.0, tax=0.25,
+                fixed_mp=2500.0, wc_mp=200.0, land_pct=0.80, mach_sale_mp=500.0,
+                spot=72.0, inf_m=0.08, inf_h=0.02,
+                wacc=cost_of_capital, rf=rf_rate, sigma=volatility,
+                bulud_m=bulud_offer, vol_mult=vol_mult, scale_wc=scale_wc,
+            )
+            pdf_buf = generate_pdf(model, rec_label,
+                                   datetime.now().strftime("%d %B %Y"), pdf_params)
             if pdf_buf:
                 st.download_button(
                     "⬇️ Download PDF",
